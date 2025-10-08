@@ -1,0 +1,4 @@
+dotenv
+boto3
+fastapi
+pydantic
