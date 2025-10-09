@@ -1,189 +1,152 @@
-#!/usr/bin/env node
 // agent/cli.mjs
-
-// Optional: load .env if dotenv is installed. Safe to leave as-is even if not installed.
-try { await import('dotenv/config'); } catch (_) { /* no .env loader; env vars can still be set via shell */ }
-
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import * as CP from "node:child_process";
-import process from "node:process";
-import { z } from "zod";
+import cp from "node:child_process";
+import fetch from "node-fetch";
 
-/* =========================
-   CONFIG
-========================= */
+// ---------- constants ----------
+const WEB_ROOT = path.join(process.cwd(), "web");
+const WEB_ROOT_WITH_SEP = WEB_ROOT + path.sep;
 
-// Resolve the Next.js app folder *relative to this file* (no env needed)
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WEB_ROOT = path.resolve(__dirname, "../web");
-if (!fs.existsSync(WEB_ROOT) || !fs.statSync(WEB_ROOT).isDirectory()) {
-  throw new Error(
-    `WEB_ROOT not found at ${WEB_ROOT}\n` +
-    `Expected layout:\n  <repo>/web  (Next.js app)\n  <repo>/agent/cli.mjs`
-  );
-}
-
-// Planner URL (comes from your .env). Fallback provided.
-const PLANNER_URL = process.env.PLANNER_URL || "http://localhost:8080/invocations";
-
-// Whitelisted commands the agent is allowed to run
-const CMD_WHITELIST = new Set([
-  "npm run dev", "npm run build", "next dev", "next build",
-  "next start", "npm run lint", "npm run typecheck"
-]);
-
-/* =========================
-   TYPES (Zod)
-========================= */
-
-const CreateFile = z.object({
-  type: z.literal("create_file"),
-  path: z.string(),
-  contents: z.string()
-});
-
-const UpdateFile = z.object({
-  type: z.literal("update_file"),
-  path: z.string(),
-  contents: z.string() // strict: full-file replacement (prevents empty updates)
-});
-
-const DeleteFile = z.object({
-  type: z.literal("delete_file"),
-  path: z.string()
-});
-
-const RunCommand = z.object({
-  type: z.literal("run_command"),
-  script: z.string()
-});
-
-const ActionSchema = z.union([CreateFile, UpdateFile, DeleteFile, RunCommand]);
-const PlanSchema = z.object({ actions: z.array(ActionSchema) });
-
-/* =========================
-   HELPERS
-========================= */
-
-function readTree(root = WEB_ROOT, max = 400) {
-  const out = [];
-  (function walk(dir) {
-    for (const f of fs.readdirSync(dir)) {
-      if (["node_modules", ".next", ".git"].includes(f)) continue;
-      const p = path.join(dir, f);
-      const st = fs.statSync(p);
-      if (st.isDirectory()) walk(p);
-      else out.push(path.relative(root, p));
-    }
-  })(root);
-  return out.slice(0, max);
-}
-
-function readIfExists(rel) {
-  const p = path.join(WEB_ROOT, rel);
-  return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
-}
-
-function safeWrite(rel, contents) {
-  const full = path.join(WEB_ROOT, rel);
-  fs.mkdirSync(path.dirname(full), { recursive: true });
-  fs.writeFileSync(full, contents);
-  console.log("✏️ wrote", rel);
-}
-
-async function runCommand(script) {
-  if (!CMD_WHITELIST.has(script)) throw new Error(`Command not allowed: ${script}`);
-  const [cmd, ...args] = script.split(" ");
-  await new Promise((resolve, reject) => {
-    const child = CP.spawn(cmd, args, {
-      cwd: WEB_ROOT,
-      stdio: "inherit",
-      shell: process.platform === "win32" // helps Windows find npm/next shims
-    });
-    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`${script} failed (${code})`))));
-  });
-}
-
-async function fetchPlan(promptText, context) {
-  if (!PLANNER_URL) throw new Error("PLANNER_URL is not set. Add it to your .env or export it.");
-  const res = await fetch(PLANNER_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ prompt: promptText, context })
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Planner HTTP ${res.status}: ${body}`);
+// ---------- helpers ----------
+async function buildContextForPlanner() {
+  async function safeRead(rel) {
+    try { return await fs.readFile(path.join(WEB_ROOT, rel), "utf8"); } catch { return null; }
   }
-  const data = await res.json(); // { plan: { actions: [...] } }
-  return PlanSchema.parse(data.plan);
+  const files = {};
+  for (const rel of [
+    "package.json",
+    "next.config.js", "next.config.ts",
+    "app/page.tsx", "app/layout.tsx", "app/global.css",
+    "pages/index.tsx"
+  ]) {
+    const c = await safeRead(rel);
+    if (c != null) files[rel] = c;
+  }
+  return { files };
 }
 
-/* =========================
-   MAIN
-========================= */
+function validatePlan(actions) {
+  const allowed = new Set(["create_file", "update_file", "delete_file", "run_command"]);
+  if (!Array.isArray(actions)) throw new Error("actions must be an array");
+  for (const a of actions) {
+    if (!allowed.has(a.type)) throw new Error(`Disallowed action: ${a.type}`);
+    if ((a.type === "create_file" || a.type === "update_file") && typeof a.contents !== "string") {
+      throw new Error(`${a.type} requires contents`);
+    }
+  }
+  return actions;
+}
 
-async function main() {
-  const userTask = process.argv.slice(2).join(" ").trim();
-  if (!userTask) {
-    console.error('Usage: npm run agent -- "Make a simple page"');
+function runWhitelistedCommand(command) {
+  const whitelist = [
+    "npm run dev", "npm run build", "npm run lint", "npm run typecheck",
+    "next dev", "next build", "next start"
+  ];
+  if (!whitelist.includes(command)) throw new Error(`Command not allowed: ${command}`);
+  return new Promise((resolve, reject) => {
+    cp.exec(command, { cwd: WEB_ROOT }, (err, stdout, stderr) => {
+      if (err) return reject(err);
+      resolve(`$ ${command}\n${stdout}\n${stderr}`);
+    });
+  });
+}
+
+function resolveInsideWeb(relPath) {
+  const abs = path.resolve(WEB_ROOT, relPath);
+  if (!abs.startsWith(WEB_ROOT_WITH_SEP)) throw new Error(`Refusing to touch outside web/: ${relPath}`);
+  return abs;
+}
+
+// Guess the route URL from changed files
+function inferPreviewPathFromActions(actions) {
+  // Prefer the last created/updated page
+  const touched = [...actions].reverse();
+  for (const a of touched) {
+    if (!("path" in a)) continue;
+    const p = a.path.replace(/\\/g, "/");
+
+    // App Router
+    if (p.startsWith("app/") && p.endsWith("/page.tsx")) {
+      const sub = p.slice("app/".length, -"/page.tsx".length);
+      // strip route groups like (marketing)
+      const cleaned = sub.split("/").filter(s => !(s.startsWith("(") && s.endsWith(")"))).join("/");
+      return "/" + cleaned; // "/" if cleaned === ""
+    }
+    // Pages Router
+    if (p.startsWith("pages/") && p.endsWith(".tsx")) {
+      const sub = p.slice("pages/".length, -".tsx".length);
+      if (sub === "index") return "/";
+      return "/" + sub.replace(/\/index$/, "");
+    }
+  }
+  // Fallback: if app/page.tsx touched, go home
+  if (touched.some(a => a.path === "app/page.tsx" || a.path === "pages/index.tsx")) return "/";
+  return null;
+}
+
+// ------------- PUBLIC API -------------
+export async function runAgent(userPrompt, { plannerUrl } = {}) {
+  const url = plannerUrl || process.env.PLANNER_URL || "http://localhost:8080/invocations";
+  const context = await buildContextForPlanner();
+
+  // timeout so API doesn’t hang the UI forever
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(new Error("Planner request timed out")), 20_000);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ input: userPrompt, context }),
+      signal: ac.signal
+    });
+  } finally {
+    clearTimeout(t);
+  }
+
+  if (!res.ok) throw new Error(`Planner error: ${res.status} ${await res.text()}`);
+  const { assistant_message, actions } = await res.json();
+
+  const plan = validatePlan(actions);
+
+  const logs = [];
+  for (const step of plan) {
+    if (step.type === "create_file" || step.type === "update_file") {
+      const target = resolveInsideWeb(step.path);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, step.contents, "utf8");
+      logs.push(`wrote ${step.path}`);
+    } else if (step.type === "delete_file") {
+      const target = resolveInsideWeb(step.path);
+      await fs.rm(target, { force: true });
+      logs.push(`deleted ${step.path}`);
+    } else if (step.type === "run_command") {
+      logs.push(await runWhitelistedCommand(step.command));
+    }
+  }
+
+  const previewPath = inferPreviewPathFromActions(plan) || "/";
+
+  return { assistant: assistant_message, plan, logs, previewPath };
+}
+
+// ------------- CLI -------------
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const prompt = process.argv.slice(2).join(" ").trim();
+  if (!prompt) {
+    console.error("Usage: npm run agent -- \"your prompt\"");
     process.exit(1);
   }
-
-  // Gather minimal context for better plans
-  const manifest = { framework: "next", router: "app", typescript: true, tailwind: true };
-  const tree = readTree();
-  const snippets = {
-    "app/layout.tsx": readIfExists("app/layout.tsx").slice(0, 2000),
-    "app/page.tsx":   readIfExists("app/page.tsx").slice(0, 2000),
-    "package.json":   readIfExists("package.json").slice(0, 2000)
-  };
-
-  // Ask the planner (FastAPI -> Bedrock Nova Pro) for a plan
-  const plan = await fetchPlan(userTask, { manifest, tree, snippets });
-
-  // Guard: forbid empty update_file (should never happen with our schema, but be safe)
-  for (const [i, a] of plan.actions.entries()) {
-    if (a.type === "update_file" && !a.contents) {
-      console.error(`Invalid update_file at actions[${i}] for ${a.path}: missing contents`);
-      console.error("Raw plan:", JSON.stringify(plan, null, 2));
+  runAgent(prompt)
+    .then(({ assistant, plan, previewPath }) => {
+      console.log("\nAssistant:\n", assistant);
+      console.log("\nPlan:\n", JSON.stringify(plan, null, 2));
+      console.log("\nPreview:\n", previewPath);
+    })
+    .catch((err) => {
+      console.error(err);
       process.exit(1);
-    }
-  }
-
-  // Execute actions
-  for (const a of plan.actions) {
-    if (a.type === "create_file") {
-      safeWrite(a.path, a.contents);
-    } else if (a.type === "update_file") {
-      safeWrite(a.path, a.contents);
-    } else if (a.type === "delete_file") {
-      const full = path.join(WEB_ROOT, a.path);
-      if (fs.existsSync(full)) {
-        fs.unlinkSync(full);
-        console.log("🗑️ deleted", a.path);
-      }
-    } else if (a.type === "run_command") {
-      await runCommand(a.script);
-    }
-  }
-
-  // Additionally start dev if any run_command happened but dev wasn't started explicitly
-  const anyRunCmd = plan.actions.some(a => a.type === "run_command");
-  const devRequested = plan.actions.some(
-    a => a.type === "run_command" && /(^|\s)(next dev|npm run dev)(\s|$)/i.test(a.script)
-  );
-  if (anyRunCmd && !devRequested) {
-    console.log("ℹ️ Plan ran a command but not dev. Launching `npm run dev`…");
-    await runCommand("npm run dev");
-  }
-
-  console.log("\n🎉 Done.");
+    });
 }
-
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});

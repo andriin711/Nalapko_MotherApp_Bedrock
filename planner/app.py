@@ -1,177 +1,149 @@
 # planner/app.py
-import os
-import json
-import datetime
-from typing import Any, Dict, List, Optional
-
-from dotenv import load_dotenv
-load_dotenv()  # load repo-root .env
-
-import boto3
-from botocore.config import Config
-from boto3.session import Session
-
+import os, json
+from typing import Any, Dict, List
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import boto3
 
-# ====== Config (EU) ======
+load_dotenv()
+
+REGION = os.getenv("AWS_REGION", os.getenv("BEDROCK_REGION", "eu-north-1"))
 MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "eu.amazon.nova-pro-v1:0")
-REGION   = os.getenv("AWS_REGION", "eu-north-1")
 
-# Validate credentials early with a friendly error
-_session = Session()
-if not _session.get_credentials():
-    raise RuntimeError(
-        "No AWS credentials detected. Provide one of:\n"
-        "- AWS_PROFILE in .env (recommended), configured via `aws configure` or `aws sso login`\n"
-        "- or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN if temporary) in env/.env\n"
-    )
+app = FastAPI(title="Planner", version="1.2.0")
 
-# Bedrock runtime client
-brt = boto3.client(
-    "bedrock-runtime",
-    region_name=REGION,
-    config=Config(read_timeout=60, connect_timeout=10, retries={"max_attempts": 2}),
-)
-
-# Helpful diagnostics on startup
-try:
-    who = boto3.client("sts").get_caller_identity().get("Arn")
-    print("👤 AWS Identity:", who)
-except Exception as e:
-    print("⚠️ Could not fetch STS caller identity:", e)
-print("🕒 Local UTC:", datetime.datetime.utcnow().isoformat() + "Z")
-print("🌍 Region:", REGION, "| 🧠 Model:", MODEL_ID)
-
-app = FastAPI(title="Nova Pro Planner (EU)")
+class PlanRequest(BaseModel):
+    input: str
+    context: Dict[str, Any] | None = None
 
 SYSTEM_PROMPT = """
-You are a codegen agent for a Next.js (App Router + TypeScript) project.
+You are a software planning agent. You must return:
+- assistant_message: a concise, friendly message to show in chat.
+- actions: a minimal sequence of steps to fulfill the user's request.
 
-Return your plan exclusively via tool "emit_plan" with valid JSON.
-Supported actions: create_file, update_file, delete_file, run_command.
+Allowed actions (emit as JSON with exact fields):
+1) create_file { "type":"create_file", "path":"app/page.tsx", "contents":"..." }
+2) update_file { "type":"update_file", "path":"app/page.tsx", "contents":"FULL new file contents" }
+3) delete_file { "type":"delete_file", "path":"app/old.tsx" }
+4) run_command { "type":"run_command", "command":"npm run build" }
 
 Rules:
-- For update_file, ALWAYS include the complete new file in "contents" (no patches/diffs).
-- Keep code compilable and lint-safe; in JSX text, do not use raw " or '. Use &ldquo; &rdquo; &rsquo; or &quot; &apos;.
-- If the app is uninitialized, create app/layout.tsx and app/page.tsx (and Tailwind files if needed).
-- After file writes, end with exactly one run_command (e.g., "npm run build" OR "npm run dev").
+- Never write outside the 'web/' project; paths are relative to that folder.
+- Prefer smallest viable change.
+- If chat-only, actions may be [].
+- If code changes, provide BOTH assistant_message and actions.
+
+Return JSON ONLY via the 'emit_plan' tool with fields:
+{ "assistant_message": string, "actions": Action[] }
 """
 
-EMIT_PLAN_TOOL = {
+TOOL_SCHEMA = {
     "name": "emit_plan",
-    "description": "Emit a JSON plan of actions to modify the Next.js project",
-    "inputSchema": {
-        "json": {
-            "type": "object",
-            "properties": {
-                "actions": {
-                    "type": "array",
-                    "items": {
-                        "anyOf": [
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "const": "create_file"},
-                                    "path": {"type": "string"},
-                                    "contents": {"type": "string"},
-                                },
-                                "required": ["type", "path", "contents"],
-                                "additionalProperties": False,
-                            },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "const": "update_file"},
-                                    "path": {"type": "string"},
-                                    "contents": {"type": "string"},
-                                },
-                                "required": ["type", "path", "contents"],
-                                "additionalProperties": False,
-                            },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "const": "delete_file"},
-                                    "path": {"type": "string"},
-                                },
-                                "required": ["type", "path"],
-                                "additionalProperties": False,
-                            },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "const": "run_command"},
-                                    "script": {"type": "string"},
-                                },
-                                "required": ["type", "script"],
-                                "additionalProperties": False,
-                            },
-                        ]
-                    },
-                }
-            },
-            "required": ["actions"],
-            "additionalProperties": False,
-        }
-    },
+    "description": "Emit the plan and the chat message",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "assistant_message": {"type": "string"},
+            "actions": {
+                "type": "array",
+                "items": {"oneOf": [
+                    {"type":"object","properties":{
+                        "type":{"type":"string","const":"create_file"},
+                        "path":{"type":"string"},
+                        "contents":{"type":"string"}}, "required":["type","path","contents"], "additionalProperties": False},
+                    {"type":"object","properties":{
+                        "type":{"type":"string","const":"update_file"},
+                        "path":{"type":"string"},
+                        "contents":{"type":"string"}}, "required":["type","path","contents"], "additionalProperties": False},
+                    {"type":"object","properties":{
+                        "type":{"type":"string","const":"delete_file"},
+                        "path":{"type":"string"}}, "required":["type","path"], "additionalProperties": False},
+                    {"type":"object","properties":{
+                        "type":{"type":"string","const":"run_command"},
+                        "command":{"type":"string"}}, "required":["type","command"], "additionalProperties": False}
+                ]}
+            }
+        },
+        "required": ["assistant_message", "actions"],
+        "additionalProperties": False
+    }
 }
 
-# ====== FastAPI models ======
-class ContextModel(BaseModel):
-    manifest: Dict[str, Any] = Field(default_factory=dict)
-    tree: List[str] = Field(default_factory=list)
-    snippets: Dict[str, str] = Field(default_factory=dict)
+br = boto3.client("bedrock-runtime", region_name=REGION)
 
-class InvokeBody(BaseModel):
-    prompt: str
-    context: Optional[ContextModel] = None
+def call_bedrock(system: str, user: str, tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+  body = {
+    "inferenceConfig": {"temperature": 0.2, "topP": 0.9},
+    "toolConfig": {"tools": [{"toolSpec": tools[0]}]},
+    "messages": [
+      {"role": "system", "content": [{"text": system}]},
+      {"role": "user", "content": [{"text": user}]},
+    ]
+  }
+  resp = br.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
+  payload = json.loads(resp["body"].read() or "{}")
 
-# ====== Helpers ======
-def _payload(prompt_text: str, ctx: ContextModel) -> str:
-    manifest = ctx.manifest or {"framework": "next", "router": "app", "typescript": True, "tailwind": True}
-    return (
-        "PROJECT_MANIFEST:\n" + json.dumps(manifest, indent=2) + "\n" +
-        "FILE_TREE (truncated):\n" + "\n".join(ctx.tree or []) + "\n" +
-        "SNIPPETS:\n" + "\n\n".join([f"{k}:\n{(v or '')[:2000]}" for k, v in (ctx.snippets or {}).items()]) +
-        "\n\nTASK:\n" + prompt_text
-    )
+  # Defensive: Nova responses can vary; prefer explicit toolCalls
+  output = payload.get("output") or {}
+  tool_calls = output.get("toolCalls") or output.get("toolcalls") or []
+  if not tool_calls:
+    # Some variants put a "message" with "toolUse"
+    msgs = payload.get("messages") or []
+    for m in msgs:
+      for c in m.get("content", []):
+        if "toolUse" in c:
+          tool_calls = [c["toolUse"]]
+          break
+  if not tool_calls:
+    raise ValueError(f"Model did not call tool. Raw: {json.dumps(payload)[:500]}")
 
-def _ask_bedrock_for_plan(prompt_text: str, ctx: ContextModel) -> Dict[str, Any]:
-    # ✅ For Nova Converse, put system prompt in top-level "system", not as a message.
-    req = {
-        "modelId": MODEL_ID,
-        "system": [
-            {"text": SYSTEM_PROMPT}
-        ],
-        "messages": [
-            {"role": "user", "content": [{"text": _payload(prompt_text, ctx)}]}
-        ],
-        "toolConfig": {"tools": [{"toolSpec": EMIT_PLAN_TOOL}]},
-    }
+  tc = tool_calls[0]
+  tool_name = tc.get("toolName") or tc.get("name")
+  if tool_name != "emit_plan":
+    raise ValueError(f"Unexpected tool: {tool_name}")
 
-    res = brt.converse(**req)
-    msg = (res.get("output") or {}).get("message") or {}
-    blocks = [b for b in (msg.get("content") or []) if "toolUse" in b]
-    if not blocks:
-        raise RuntimeError("Model did not emit toolUse; check model access or tighten prompt.")
-    tu = blocks[0]["toolUse"]
-    if tu.get("name") != "emit_plan":
-        raise RuntimeError(f"Unexpected tool name: {tu.get('name')}")
-    plan = tu.get("input") or {}
-
-    # Guard: forbid empty update_file
-    for i, a in enumerate(plan.get("actions", [])):
-        if a.get("type") == "update_file" and not a.get("contents"):
-            raise RuntimeError(f"Invalid update_file at index {i}: missing contents")
-    return plan
-
-# ====== Route ======
-@app.post("/invocations")
-def invocations(body: InvokeBody):
+  # Arguments may be in different fields across SDKs
+  raw_args = tc.get("toolArguments") or tc.get("arguments") or tc.get("toolInput") or "{}"
+  if isinstance(raw_args, str):
     try:
-        ctx = body.context or ContextModel()
-        plan = _ask_bedrock_for_plan(body.prompt, ctx)
-        return {"plan": plan}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+      args = json.loads(raw_args)
+    except Exception:
+      raise ValueError(f"Tool args not JSON: {raw_args[:200]}")
+  else:
+    args = raw_args
+
+  return args
+
+@app.post("/invocations")
+def invocations(req: PlanRequest):
+  try:
+    user_text = req.input
+    if req.context:
+      user_text += "\n\nAdditional context:\n" + json.dumps(req.context, indent=2)
+
+    out = call_bedrock(SYSTEM_PROMPT, user_text, [TOOL_SCHEMA])
+
+    if not isinstance(out, dict):
+      raise ValueError("Planner output not an object.")
+    if "assistant_message" not in out or "actions" not in out:
+      raise ValueError("Planner output missing required fields.")
+    if not isinstance(out["actions"], list):
+      raise ValueError("actions must be an array.")
+
+    for a in out["actions"]:
+      t = a.get("type")
+      if t in ("create_file", "update_file"):
+        if not a.get("path"): raise ValueError(f"{t} missing path")
+        if not isinstance(a.get("contents"), str) or not a["contents"].strip():
+          raise ValueError(f"{t} must include non-empty contents for {a.get('path')}")
+      elif t == "delete_file":
+        if not a.get("path"): raise ValueError("delete_file missing path")
+      elif t == "run_command":
+        if not a.get("command"): raise ValueError("run_command missing command")
+      else:
+        raise ValueError(f"Unknown action type: {t}")
+
+    return out
+  except Exception as e:
+    raise HTTPException(status_code=400, detail=str(e))
