@@ -1,11 +1,11 @@
 import "server-only";
 
-/**
- * Use a STATIC relative import so Next can analyze it.
- * Requires next.config.js → experimental.externalDir = true
- */
 export async function runAgent(prompt: string) {
-  // @ts-ignore: importing ESM .mjs from outside /web
+  console.log("[agent-bridge] importing ../../agent/cli.mjs");
+  // @ts-ignore importing ESM .mjs outside /web
   const mod = await import("../../agent/cli.mjs");
-  return mod.runAgent(prompt, {});
+  console.log("[agent-bridge] imported agent. running runAgent(prompt) …");
+  const result = await mod.runAgent(prompt, {});
+  console.log("[agent-bridge] runAgent finished.");
+  return result;
 }

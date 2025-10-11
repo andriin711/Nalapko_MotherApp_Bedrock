@@ -3,9 +3,14 @@ import path from "node:path";
 import cp from "node:child_process";
 import fetch from "node-fetch";
 
-const WEB_ROOT = path.join(process.cwd(), "web");
+/* -------------------- Synchronous WEB_ROOT detection -------------------- */
+// Next runs the server with cwd = <repo>/web, but the CLI uses cwd = <repo>.
+// Avoid top-level async — decide purely from cwd string.
+const CWD = process.cwd();
+const WEB_ROOT = path.basename(CWD).toLowerCase() === "web" ? CWD : path.join(CWD, "web");
 const WEB_ROOT_WITH_SEP = WEB_ROOT + path.sep;
 
+/* -------------------- Helpers -------------------- */
 async function buildContextForPlanner() {
   async function safeRead(rel) {
     try { return await fs.readFile(path.join(WEB_ROOT, rel), "utf8"); } catch { return null; }
@@ -35,17 +40,28 @@ function validatePlan(actions) {
   return actions;
 }
 
-function runWhitelistedCommand(command) {
-  const whitelist = [
-    "npm run dev", "npm run build", "npm run lint", "npm run typecheck",
-    "next dev", "next build", "next start"
-  ];
-  if (!whitelist.includes(command)) throw new Error(`Command not allowed: ${command}`);
+// Only short, terminating commands; never dev/start
+const ALLOWED_COMMANDS = new Set([
+  "npm run build",
+  "npm run lint",
+  "npm run typecheck",
+  "next build"
+]);
+
+function runWhitelistedCommand(command, { timeoutMs = 15000 } = {}) {
+  if (!ALLOWED_COMMANDS.has(command)) {
+    return Promise.resolve(`skipped disallowed command: ${command}`);
+  }
   return new Promise((resolve, reject) => {
-    cp.exec(command, { cwd: WEB_ROOT }, (err, stdout, stderr) => {
+    const child = cp.exec(command, { cwd: WEB_ROOT }, (err, stdout, stderr) => {
       if (err) return reject(err);
       resolve(`$ ${command}\n${stdout}\n${stderr}`);
     });
+    const t = setTimeout(() => {
+      try { child.kill(); } catch {}
+      reject(new Error(`command timed out after ${timeoutMs}ms: ${command}`));
+    }, timeoutMs);
+    child.on("close", () => clearTimeout(t));
   });
 }
 
@@ -60,7 +76,6 @@ function inferPreviewPathFromActions(actions) {
   for (const a of touched) {
     if (!("path" in a)) continue;
     const p = a.path.replace(/\\/g, "/");
-
     if (p.startsWith("app/") && p.endsWith("/page.tsx")) {
       const sub = p.slice("app/".length, -"/page.tsx".length);
       const cleaned = sub.split("/").filter(s => !(s.startsWith("(") && s.endsWith(")"))).join("/");
@@ -76,12 +91,12 @@ function inferPreviewPathFromActions(actions) {
   return null;
 }
 
-// --------- PUBLIC API ----------
+/* -------------------- PUBLIC API -------------------- */
 export async function runAgent(userPrompt, { plannerUrl } = {}) {
-  const url = plannerUrl || process.env.PLANNER_URL || "http://localhost:8080/invocations";
+  const url = plannerUrl || process.env.PLANNER_URL || "http://127.0.0.1:8080/invocations";
   const context = await buildContextForPlanner();
 
-  // 20s timeout to avoid hanging if planner is down
+  // 20s timeout to avoid hanging if planner stalls/unreachable
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(new Error("Planner request timed out")), 20_000);
 
@@ -114,16 +129,20 @@ export async function runAgent(userPrompt, { plannerUrl } = {}) {
       await fs.rm(target, { force: true });
       logs.push(`deleted ${step.path}`);
     } else if (step.type === "run_command") {
-      logs.push(await runWhitelistedCommand(step.command));
+      try {
+        const out = await runWhitelistedCommand(step.command);
+        logs.push(out);
+      } catch (e) {
+        logs.push(`command failed: ${step.command}\n${String(e)}`);
+      }
     }
   }
 
   const previewPath = inferPreviewPathFromActions(plan) || "/";
-
   return { assistant: assistant_message, plan, logs, previewPath };
 }
 
-// --------- CLI ----------
+/* -------------------- CLI (optional) -------------------- */
 if (import.meta.url === `file://${process.argv[1]}`) {
   const prompt = process.argv.slice(2).join(" ").trim();
   if (!prompt) {
@@ -131,17 +150,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(1);
   }
   runAgent(prompt)
-    .then((result) => {
-      const { assistant, plan, previewPath } = result;
+    .then(({ assistant, plan, previewPath }) => {
       console.log("\nAssistant:\n", assistant);
       console.log("\nPlan:\n", JSON.stringify(plan, null, 2));
       console.log("\nPreview:\n", previewPath);
-      // Emit a final, easy-to-parse JSON line for the web server:
-      console.log("AGENT_JSON:" + JSON.stringify(result));
     })
     .catch((err) => {
-      console.error(err && err.stack || String(err));
+      console.error(err);
       process.exit(1);
     });
 }
-
