@@ -5,7 +5,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import boto3
@@ -31,10 +31,11 @@ app = FastAPI(title="Planner + Chat + Codegen", version="3.0.0")
 class BedrockClient:
     def __init__(self, model_id: str, region: str):
         self.model_id = model_id
+        # Keep structure; slightly shorter timeouts to avoid long hangs
         self.client = boto3.client(
             "bedrock-runtime",
             region_name=region,
-            config=Config(read_timeout=60, retries={"max_attempts": 3}),
+            config=Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 2}),
         )
 
     def converse(
@@ -165,18 +166,105 @@ class CodeGenResponse(BaseModel):
     files: List[Dict[str, str]]  # { path, contents }
 
 # -----------------------------
-# In‑memory chat store (swap for Redis/DB later)
+# In-memory chat store (swap for Redis/DB later)
 # -----------------------------
 _SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
-
 
 def _new_session_id() -> str:
     return str(uuid.uuid4())
 
-
 def _get_history(session_id: str) -> List[Dict[str, Any]]:
     return _SESSIONS.setdefault(session_id, [])
 
+# -----------------------------
+# Minimal preview plumbing
+# -----------------------------
+_PREVIEW_HTML: str = ""  # updated by /code/generate
+
+# If TSX is returned (e.g., layout.tsx), this wrapper lets the browser render it for preview.
+def _tsx_wrapper(tsx_filename: str, tsx_code: str) -> str:
+    return f"""<!doctype html>
+<html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{tsx_filename} preview</title>
+<style>html,body,#root{{height:100%;margin:0}}*,*:before,*:after{{box-sizing:border-box}}</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body><div id="root"></div>
+<script type="text/babel" data-presets="typescript,react">
+{tsx_code}
+try {{
+  const C = (typeof RootLayout!=='undefined'&&RootLayout)
+         || (typeof App!=='undefined'&&App)
+         || (typeof Layout!=='undefined'&&Layout);
+  if (!C) throw new Error('No RootLayout/App/Layout export found to mount.');
+  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(C, {{}}));
+}} catch (e) {{
+  const pre = document.createElement('pre'); pre.textContent = 'Preview error:\\n' + String(e);
+  document.body.appendChild(pre);
+}}
+</script>
+</body></html>"""
+
+def _choose_preview_html(files: List[Dict[str, str]]) -> str:
+    # 1) Prefer index.html if provided
+    for f in files:
+        p = f.get("path", "").lower()
+        if p.endswith("index.html"):
+            return f.get("contents", "")
+    # 2) TSX candidates (layout.tsx/app.tsx/etc.)
+    tsx_names = {"layout.tsx", "app.tsx", "App.tsx", "index.tsx"}
+    for f in files:
+        name = f.get("path", "").split("/")[-1]
+        if name in tsx_names or name.lower().endswith(".tsx"):
+            return _tsx_wrapper(f.get("path", ""), f.get("contents", ""))
+    # 3) Any other html
+    for f in files:
+        if f.get("path", "").lower().endswith(".html"):
+            return f.get("contents", "")
+    # 4) Fallback: show first file as text
+    if files:
+        first = files[0]
+        return f"<pre>{first.get('path','(no path)')}\\n\\n{first.get('contents','')}</pre>"
+    return "<p>(no content)</p>"
+
+# Preview-only shell: hide elements marked for preview suppression
+_SHELL_PREVIEW = """<!doctype html>
+<html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  html,body{height:100%;margin:0;padding:0}*,*:before,*:after{box-sizing:border-box}
+  body{overflow:hidden}   /* keep inside preview window */
+  #root{min-height:100%}
+  /* hide ONLY inside preview */
+  [data-hide-in-preview], .hide-in-preview { display:none !important; }
+</style>
+<title>{title}</title></head>
+<body><div id="root">{content}</div></body></html>"""
+
+# Full-page shell: no hiding
+_SHELL_PAGE = """<!doctype html>
+<html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  html,body{height:100%;margin:0;padding:0}*,*:before,*:after{box-sizing:border-box}
+  body{overflow:auto}
+  #root{min-height:100%}
+</style>
+<title>{title}</title></head>
+<body><div id="root">{content}</div></body></html>"""
+
+@app.get("/preview")
+def preview():
+    html = _SHELL_PREVIEW.format(title="Preview", content=_PREVIEW_HTML or "<p>(no content yet)</p>")
+    return HTMLResponse(html)
+
+@app.get("/page")
+def page():
+    html = _SHELL_PAGE.format(title="Full Page", content=_PREVIEW_HTML or "<p>(no content yet)</p>")
+    return HTMLResponse(html)
 
 # -----------------------------
 # Endpoints
@@ -200,7 +288,6 @@ def plan_endpoint(req: PlanRequest):
     except Exception as e:
         log.exception("Planner error")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/chat/send", response_model=ChatSendResponse)
 def chat_send(req: ChatSendRequest):
@@ -229,10 +316,11 @@ def chat_send(req: ChatSendRequest):
         log.exception("Chat error")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/code/generate", response_model=CodeGenResponse)
 def code_generate(req: CodeGenRequest):
-    """One-shot code generation endpoint. Uses emit_files tool to return files."""
+    """One-shot code generation endpoint. Uses emit_files tool to return files.
+    Also updates the preview so /preview and /page reflect layout.tsx and HTML changes.
+    """
     try:
         prompt_lines = [req.instructions]
         if req.language:
@@ -265,17 +353,19 @@ def code_generate(req: CodeGenRequest):
         if not files:
             raise HTTPException(status_code=502, detail="Model did not return files or text.")
 
+        # --- Update preview for HTML OR TSX (layout.tsx/app.tsx/etc.) ---
+        global _PREVIEW_HTML
+        _PREVIEW_HTML = _choose_preview_html(files)
+
         return CodeGenResponse(files=files)
     except Exception as e:
         log.exception("Codegen error")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/chat/history/{session_id}")
 def chat_history(session_id: str):
     """Return raw Bedrock-formatted history for a session (debug/dev only)."""
     return JSONResponse(content={"session_id": session_id, "history": _SESSIONS.get(session_id, [])})
-
 
 # Healthcheck
 @app.get("/healthz")
