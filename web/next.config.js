@@ -1,7 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    externalDir: true, // allow ../../agent import from within web/
+    externalDir: true, // allow importing ../../agent from within /web
   },
 };
 

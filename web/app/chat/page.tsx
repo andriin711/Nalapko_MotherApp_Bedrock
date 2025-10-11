@@ -1,4 +1,3 @@
-// web/app/chat/page.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -23,21 +22,29 @@ export default function ChatPage() {
     setBusy(true);
     setStatus("Working on your request…");
 
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: text })
-      });
-      const data = await res.json();
+    // Client-side timeout (35s) to guarantee the UI doesn't spin forever
+    const timeout = (ms: number) =>
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`Client timeout after ${ms}ms`)), ms));
 
-      if (!res.ok) throw new Error(data?.error || "Request failed");
+    try {
+      const res = await Promise.race([
+        fetch("/api/chat", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ message: text })
+        }),
+        timeout(35_000)
+      ]);
+
+      const data = await (res as Response).json();
+
+      if (!(res as Response).ok) {
+        throw new Error(data?.error || "Request failed");
+      }
 
       setMessages((m) => [...m, { role: "assistant", content: data.assistant || "(no reply)" }]);
 
-      // Navigate preview to the most relevant route the agent changed/created
       if (data.previewPath && typeof data.previewPath === "string") {
-        // Force-reload even if same path by adding a cache-buster
         const url = data.previewPath + (data.previewPath.includes("?") ? "&" : "?") + "_ts=" + Date.now();
         setPreviewSrc(url);
         setStatus(`Updated files. Previewing ${data.previewPath}`);
@@ -46,11 +53,10 @@ export default function ChatPage() {
       }
     } catch (e: any) {
       setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${e.message}` }]);
-      setStatus("Something went wrong. Check server logs.");
+      setStatus("Something went wrong. Check planner & AWS config.");
     } finally {
       setBusy(false);
-      // Hide status after a moment
-      setTimeout(() => setStatus(null), 2500);
+      setTimeout(() => setStatus(null), 3000);
     }
   }
 

@@ -1,14 +1,11 @@
-// agent/cli.mjs
 import fs from "node:fs/promises";
 import path from "node:path";
 import cp from "node:child_process";
 import fetch from "node-fetch";
 
-// ---------- constants ----------
 const WEB_ROOT = path.join(process.cwd(), "web");
 const WEB_ROOT_WITH_SEP = WEB_ROOT + path.sep;
 
-// ---------- helpers ----------
 async function buildContextForPlanner() {
   async function safeRead(rel) {
     try { return await fs.readFile(path.join(WEB_ROOT, rel), "utf8"); } catch { return null; }
@@ -58,39 +55,33 @@ function resolveInsideWeb(relPath) {
   return abs;
 }
 
-// Guess the route URL from changed files
 function inferPreviewPathFromActions(actions) {
-  // Prefer the last created/updated page
   const touched = [...actions].reverse();
   for (const a of touched) {
     if (!("path" in a)) continue;
     const p = a.path.replace(/\\/g, "/");
 
-    // App Router
     if (p.startsWith("app/") && p.endsWith("/page.tsx")) {
       const sub = p.slice("app/".length, -"/page.tsx".length);
-      // strip route groups like (marketing)
       const cleaned = sub.split("/").filter(s => !(s.startsWith("(") && s.endsWith(")"))).join("/");
-      return "/" + cleaned; // "/" if cleaned === ""
+      return "/" + cleaned;
     }
-    // Pages Router
     if (p.startsWith("pages/") && p.endsWith(".tsx")) {
       const sub = p.slice("pages/".length, -".tsx".length);
       if (sub === "index") return "/";
       return "/" + sub.replace(/\/index$/, "");
     }
   }
-  // Fallback: if app/page.tsx touched, go home
   if (touched.some(a => a.path === "app/page.tsx" || a.path === "pages/index.tsx")) return "/";
   return null;
 }
 
-// ------------- PUBLIC API -------------
+// --------- PUBLIC API ----------
 export async function runAgent(userPrompt, { plannerUrl } = {}) {
   const url = plannerUrl || process.env.PLANNER_URL || "http://localhost:8080/invocations";
   const context = await buildContextForPlanner();
 
-  // timeout so API doesn’t hang the UI forever
+  // 20s timeout to avoid hanging if planner is down
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(new Error("Planner request timed out")), 20_000);
 
@@ -132,7 +123,7 @@ export async function runAgent(userPrompt, { plannerUrl } = {}) {
   return { assistant: assistant_message, plan, logs, previewPath };
 }
 
-// ------------- CLI -------------
+// --------- CLI ----------
 if (import.meta.url === `file://${process.argv[1]}`) {
   const prompt = process.argv.slice(2).join(" ").trim();
   if (!prompt) {
