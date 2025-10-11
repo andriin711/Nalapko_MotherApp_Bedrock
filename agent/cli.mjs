@@ -1,32 +1,12 @@
+// agent/cli.mjs
 import fs from "node:fs/promises";
 import path from "node:path";
 import cp from "node:child_process";
-import fetch from "node-fetch";
 
-/* -------------------- Synchronous WEB_ROOT detection -------------------- */
-// Next runs the server with cwd = <repo>/web, but the CLI uses cwd = <repo>.
-// Avoid top-level async — decide purely from cwd string.
+// Detect /web even when server CWD is /web already
 const CWD = process.cwd();
 const WEB_ROOT = path.basename(CWD).toLowerCase() === "web" ? CWD : path.join(CWD, "web");
 const WEB_ROOT_WITH_SEP = WEB_ROOT + path.sep;
-
-/* -------------------- Helpers -------------------- */
-async function buildContextForPlanner() {
-  async function safeRead(rel) {
-    try { return await fs.readFile(path.join(WEB_ROOT, rel), "utf8"); } catch { return null; }
-  }
-  const files = {};
-  for (const rel of [
-    "package.json",
-    "next.config.js", "next.config.ts",
-    "app/page.tsx", "app/layout.tsx", "app/global.css",
-    "pages/index.tsx"
-  ]) {
-    const c = await safeRead(rel);
-    if (c != null) files[rel] = c;
-  }
-  return { files };
-}
 
 function validatePlan(actions) {
   const allowed = new Set(["create_file", "update_file", "delete_file", "run_command"]);
@@ -40,7 +20,6 @@ function validatePlan(actions) {
   return actions;
 }
 
-// Only short, terminating commands; never dev/start
 const ALLOWED_COMMANDS = new Set([
   "npm run build",
   "npm run lint",
@@ -91,12 +70,28 @@ function inferPreviewPathFromActions(actions) {
   return null;
 }
 
-/* -------------------- PUBLIC API -------------------- */
+async function buildContextInline() {
+  async function safeRead(rel) {
+    try { return await fs.readFile(path.join(WEB_ROOT, rel), "utf8"); } catch { return null; }
+  }
+  const files = {};
+  for (const rel of [
+    "package.json",
+    "next.config.js", "next.config.ts",
+    "app/page.tsx", "app/layout.tsx", "app/global.css",
+    "pages/index.tsx"
+  ]) {
+    const c = await safeRead(rel);
+    if (c != null) files[rel] = c;
+  }
+  return { files };
+}
+
 export async function runAgent(userPrompt, { plannerUrl } = {}) {
   const url = plannerUrl || process.env.PLANNER_URL || "http://127.0.0.1:8080/invocations";
-  const context = await buildContextForPlanner();
+  const context = await buildContextInline();
 
-  // 20s timeout to avoid hanging if planner stalls/unreachable
+  // 20s timeout so API never hangs forever
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(new Error("Planner request timed out")), 20_000);
 
@@ -142,7 +137,7 @@ export async function runAgent(userPrompt, { plannerUrl } = {}) {
   return { assistant: assistant_message, plan, logs, previewPath };
 }
 
-/* -------------------- CLI (optional) -------------------- */
+// CLI helper (optional)
 if (import.meta.url === `file://${process.argv[1]}`) {
   const prompt = process.argv.slice(2).join(" ").trim();
   if (!prompt) {
