@@ -131,13 +131,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(1);
   }
   runAgent(prompt)
-    .then(({ assistant, plan, previewPath }) => {
+    .then((result) => {
+      const { assistant, plan, previewPath } = result;
       console.log("\nAssistant:\n", assistant);
       console.log("\nPlan:\n", JSON.stringify(plan, null, 2));
       console.log("\nPreview:\n", previewPath);
+      // Emit a final, easy-to-parse JSON line for the web server:
+      console.log("AGENT_JSON:" + JSON.stringify(result));
     })
     .catch((err) => {
-      console.error(err);
+      console.error(err && err.stack || String(err));
       process.exit(1);
     });
 }
+

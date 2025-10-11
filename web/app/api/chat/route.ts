@@ -3,7 +3,6 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Hard server-side cap so responses never hang forever
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return Promise.race<T>([
     p,
@@ -18,10 +17,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing 'message'." }, { status: 400 });
     }
 
-    const { runAgent } = await import("../../../server/agent-bridge");
+    // Use the CLI-based runner (bypasses any bundler/import quirks)
+    const { runAgentViaCLI } = await import("../../../server/run-agent-via-cli");
 
-    // 30s absolute server timeout
-    const result = await withTimeout(runAgent(message), 30_000);
+    // 30s hard cap from the server side
+    const result = await withTimeout(runAgentViaCLI(message), 30_000);
 
     return NextResponse.json(result);
   } catch (err: any) {
